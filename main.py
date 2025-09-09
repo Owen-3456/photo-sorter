@@ -30,7 +30,7 @@ SCRIPT_DIR = Path(__file__).parent
 SOURCE_DIR = SCRIPT_DIR / "unsorted_photos"
 DEST_DIR = SCRIPT_DIR / "sorted_photos"
 NO_DATE_DIR = DEST_DIR / "no_date"
-NOT_PHOTOS_DIR = DEST_DIR / "not_photos"
+ARCHIVES_DIR = DEST_DIR / "archives"  # Folder for archive files
 ERROR_DIR = DEST_DIR / "errors"  # Folder for files that cause processing errors
 CONVERTED_DIR = (
     DEST_DIR / "converted_originals"
@@ -52,6 +52,45 @@ VIDEO_EXTENSIONS = {
 }
 # HEIC/HEIF extensions specifically
 HEIC_EXTENSIONS = {".heic", ".heif"}
+# Common archive file extensions (case-insensitive)
+ARCHIVE_EXTENSIONS = {
+    ".zip",
+    ".rar",
+    ".7z",
+    ".tar",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".tar.gz",
+    ".tar.bz2",
+    ".tar.xz",
+}
+
+
+def get_file_size_category(file_path):
+    """
+    Categorizes files by size to create more evenly distributed subfolders.
+    Returns a string category based on file size.
+    """
+    try:
+        size_bytes = file_path.stat().st_size
+        size_mb = size_bytes / (1024 * 1024)
+
+        if size_mb < 0.5:
+            return "tiny_under_0.5MB"
+        elif size_mb < 1:
+            return "small_0.5-1MB"
+        elif size_mb < 2:
+            return "medium_1-2MB"
+        elif size_mb < 5:
+            return "large_2-5MB"
+        elif size_mb < 10:
+            return "xlarge_5-10MB"
+        else:
+            return "huge_over_10MB"
+    except Exception as e:
+        logging.warning(f"Could not get file size for {file_path}: {e}")
+        return "unknown_size"
 
 
 def get_date_taken(file_path):
@@ -133,7 +172,7 @@ def sort_photos():
     # Create destination directories if they don't exist
     DEST_DIR.mkdir(exist_ok=True)
     NO_DATE_DIR.mkdir(exist_ok=True)
-    NOT_PHOTOS_DIR.mkdir(exist_ok=True)  # Renamed conceptually, now 'not_media'
+    ARCHIVES_DIR.mkdir(exist_ok=True)
     ERROR_DIR.mkdir(exist_ok=True)
     # Optional: Create dir for original HEICs if you want to keep them
     # CONVERTED_DIR.mkdir(exist_ok=True)
@@ -145,7 +184,8 @@ def sort_photos():
     video_moved_count = 0
     heic_converted_count = 0
     no_date_count = 0
-    not_media_count = 0  # Renamed counter
+    archive_moved_count = 0  # Counter for archive files
+    deleted_non_media_count = 0  # Changed from not_media_count
     error_count = 0
     skipped_count = 0
     duplicate_deleted_count = 0
@@ -186,13 +226,29 @@ def sort_photos():
                     media_type = "video"
                     # Videos generally don't have EXIF date, treat as no_date unless specific metadata exists (not implemented here)
                     year_or_status = None  # Assume no date for videos
+                elif file_ext in ARCHIVE_EXTENSIONS:
+                    media_type = "archive"
+                    target_folder = ARCHIVES_DIR
+                    archive_moved_count += 1
+                    logging.info(
+                        f"Moving '{source_path.name}' to '{target_folder.name}' (archive file)"
+                    )
                 else:
                     media_type = "other"
-                    target_folder = NOT_PHOTOS_DIR  # Move non-media files
-                    not_media_count += 1
-                    logging.info(
-                        f"Moving '{source_path.name}' to '{target_folder.name}' (not a recognized media file)"
-                    )
+                    # Delete non-media files
+                    try:
+                        os.remove(source_path)
+                        deleted_non_media_count += 1
+                        logging.info(
+                            f"Deleted '{source_path.name}' (not a recognized media file)"
+                        )
+                        continue  # Skip to next file
+                    except OSError as e:
+                        logging.error(
+                            f"Could not delete non-media file '{source_path}': {e}"
+                        )
+                        error_count += 1
+                        continue  # Skip to next file
 
                 # Determine target folder based on date for media files
                 if media_type in ["image", "video"]:
@@ -208,10 +264,12 @@ def sort_photos():
                             f"Processing '{source_path.name}' ({media_type}) for year '{year_or_status}'"
                         )
                     else:  # No date found (None returned from get_date_taken or it's a video)
-                        target_folder = NO_DATE_DIR
+                        # Use file size to categorize no_date files into subfolders
+                        size_category = get_file_size_category(source_path)
+                        target_folder = NO_DATE_DIR / size_category
                         no_date_count += 1  # Increment here based on determination
                         logging.info(
-                            f"Processing '{source_path.name}' ({media_type}) for '{target_folder.name}' (no EXIF date found or video)"
+                            f"Processing '{source_path.name}' ({media_type}) for '{target_folder.name}' (no EXIF date found, sorting by size: {size_category})"
                         )
 
                 # --- Action: Convert HEIC, Move Video/Other Image, or Move Non-Media ---
@@ -317,7 +375,7 @@ def sort_photos():
                             ).add(current_file_hash)
 
                             # Increment move counts based on target folder
-                            if target_folder == NO_DATE_DIR:
+                            if str(target_folder).startswith(str(NO_DATE_DIR)):
                                 # no_date_count already incremented earlier
                                 pass
                             elif target_folder != ERROR_DIR:
@@ -388,13 +446,13 @@ def sort_photos():
 
                     # Increment appropriate counter after successful move
                     if media_type == "video":
-                        if target_folder == NO_DATE_DIR:
+                        if str(target_folder).startswith(str(NO_DATE_DIR)):
                             # no_date_count already incremented earlier
                             pass
                         elif target_folder != ERROR_DIR:
                             video_moved_count += 1
                     elif media_type == "image":  # Non-HEIC images
-                        if target_folder == NO_DATE_DIR:
+                        if str(target_folder).startswith(str(NO_DATE_DIR)):
                             # no_date_count already incremented earlier
                             pass
                         elif target_folder != ERROR_DIR:
@@ -438,11 +496,10 @@ def sort_photos():
     logging.info(f"Videos moved to year folders: {video_moved_count}")
     logging.info(f"HEIC files converted to JPEG: {heic_converted_count}")
     logging.info(
-        f"Media files moved to '{NO_DATE_DIR.name}' (no EXIF date or video): {no_date_count}"
+        f"Media files moved to '{NO_DATE_DIR.name}' subfolders (no EXIF date, sorted by size): {no_date_count}"
     )  # Updated log message
-    logging.info(
-        f"Non-media files moved to '{NOT_PHOTOS_DIR.name}': {not_media_count}"
-    )  # Updated name
+    logging.info(f"Archive files moved to '{ARCHIVES_DIR.name}': {archive_moved_count}")
+    logging.info(f"Non-media files deleted: {deleted_non_media_count}")
     logging.info(f"Files moved to '{ERROR_DIR.name}' due to errors: {error_count}")
     logging.info(
         f"Files skipped (e.g., already in destination, not found): {skipped_count}"
