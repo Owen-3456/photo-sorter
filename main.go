@@ -470,95 +470,274 @@ func extractMP4CreationTime(path string) (time.Time, bool) {
 	}
 	defer file.Close()
 
-	// Read more of the file to find metadata atoms (many MP4s have mvhd deeper in the file)
-	buffer := make([]byte, 65536) // Read first 64KB
-	n, err := file.Read(buffer)
-	if err != nil || n < 8 {
-		log.Printf("Failed to read enough data from video file: %s", filepath.Base(path))
+	fi, err := file.Stat()
+	if err != nil {
+		return time.Time{}, false
+	}
+	fileSize := fi.Size()
+	if fileSize < 16 {
 		return time.Time{}, false
 	}
 
-	// Look for 'moov' atom first, then 'mvhd' within it
-	moovPos := bytes.Index(buffer[:n], []byte("moov"))
-	if moovPos == -1 {
+	// Helper to read atom header (size + type). Returns payload start offset and size.
+	readAtomHeader := func(f *os.File, at int64) (atomType string, atomSize int64, headerLen int64, ok bool) {
+		if at+8 > fileSize {
+			return "", 0, 0, false
+		}
+		if _, err := f.Seek(at, io.SeekStart); err != nil {
+			return "", 0, 0, false
+		}
+		header := make([]byte, 8)
+		if _, err := io.ReadFull(f, header); err != nil {
+			return "", 0, 0, false
+		}
+		size := int64(binary.BigEndian.Uint32(header[0:4]))
+		typ := string(header[4:8])
+		hdrLen := int64(8)
+		if size == 1 { // 64-bit extended size
+			ext := make([]byte, 8)
+			if _, err := io.ReadFull(f, ext); err != nil {
+				return "", 0, 0, false
+			}
+			size = int64(binary.BigEndian.Uint64(ext))
+			hdrLen = 16
+		} else if size == 0 { // extends to EOF
+			size = fileSize - at
+		}
+		// Basic sanity
+		if size < hdrLen || at+size > fileSize {
+			return "", 0, 0, false
+		}
+		return typ, size, hdrLen, true
+	}
+
+	// Locate 'moov' atom (may be at end of file if fast-start not applied)
+	var moovPayloadOffset int64
+	var moovPayloadSize int64
+	offset := int64(0)
+	for offset < fileSize {
+		typ, size, hdrLen, ok := readAtomHeader(file, offset)
+		if !ok || size == 0 {
+			break
+		}
+		if typ == "moov" {
+			moovPayloadOffset = offset + hdrLen
+			moovPayloadSize = size - hdrLen
+			break
+		}
+		// Skip to next top-level atom
+		offset += size
+	}
+
+	if moovPayloadOffset == 0 || moovPayloadSize <= 0 {
 		log.Printf("No 'moov' atom found in video file: %s", filepath.Base(path))
 		return time.Time{}, false
 	}
 
-	// Look for 'mvhd' (movie header) atom after the moov atom
-	searchStart := moovPos
-	mvhdPos := bytes.Index(buffer[searchStart:n], []byte("mvhd"))
-	if mvhdPos == -1 {
-		log.Printf("No 'mvhd' atom found in video file: %s", filepath.Base(path))
-		return time.Time{}, false
+	// Walk atoms inside moov to find mvhd
+	innerOffset := int64(0)
+	for innerOffset < moovPayloadSize {
+		atomStart := moovPayloadOffset + innerOffset
+		typ, size, _, ok := readAtomHeader(file, atomStart)
+		if !ok || size == 0 {
+			break
+		}
+		if typ == "mvhd" {
+			// Read mvhd header contents after version+flags
+			versionFlags := make([]byte, 4)
+			if _, err := io.ReadFull(file, versionFlags); err != nil {
+				return time.Time{}, false
+			}
+			version := versionFlags[0]
+			const mp4Epoch = 2082844800 // Seconds between 1904-01-01 and 1970-01-01
+			if version == 1 {
+				// creation_time (8) + modification_time (8)
+				buf := make([]byte, 8)
+				if _, err := io.ReadFull(file, buf); err != nil {
+					return time.Time{}, false
+				}
+				creation := binary.BigEndian.Uint64(buf)
+				if creation < mp4Epoch { // skip invalid
+					return time.Time{}, false
+				}
+				unixSecs := int64(creation - mp4Epoch)
+				ct := time.Unix(unixSecs, 0).UTC()
+				log.Printf("Extracted creation time (v1 mvhd) from %s: %s", filepath.Base(path), ct.Format(time.RFC3339))
+				return ct, true
+			} else { // version 0
+				buf := make([]byte, 4)
+				if _, err := io.ReadFull(file, buf); err != nil {
+					return time.Time{}, false
+				}
+				creation := binary.BigEndian.Uint32(buf)
+				if creation == 0 { // ignore zero
+					return time.Time{}, false
+				}
+				if creation < mp4Epoch { // probable corruption
+					return time.Time{}, false
+				}
+				unixSecs := int64(creation - mp4Epoch)
+				ct := time.Unix(unixSecs, 0).UTC()
+				log.Printf("Extracted creation time (mvhd) from %s: %s", filepath.Base(path), ct.Format(time.RFC3339))
+				return ct, true
+			}
+		}
+		// Move to next atom inside moov
+		innerOffset += size
 	}
 
-	// Adjust mvhdPos to be relative to the entire buffer
-	mvhdPos += searchStart
-
-	// Check if we have enough data for the creation time
-	if mvhdPos+12 >= n {
-		log.Printf("Not enough data after mvhd atom in video file: %s", filepath.Base(path))
-		return time.Time{}, false
-	}
-
-	// Read 4 bytes for creation time (big-endian uint32)
-	// Creation time is at offset +4 from 'mvhd' atom
-	creationTimeBytes := buffer[mvhdPos+4 : mvhdPos+8]
-	creationTimeSeconds := binary.BigEndian.Uint32(creationTimeBytes)
-
-	log.Printf("Raw creation time from %s: %d", filepath.Base(path), creationTimeSeconds)
-
-	// MP4 time is seconds since January 1, 1904 (not Unix epoch)
-	// Convert to Unix time by subtracting the difference
-	const mp4Epoch = 2082844800 // Seconds between 1904-01-01 and 1970-01-01
-	if creationTimeSeconds == 0 {
-		log.Printf("Creation time is zero in video file: %s", filepath.Base(path))
-		return time.Time{}, false
-	}
-	if creationTimeSeconds < mp4Epoch {
-		log.Printf("Creation time (%d) is before MP4 epoch in video file: %s", creationTimeSeconds, filepath.Base(path))
-		return time.Time{}, false
-	}
-
-	unixSeconds := int64(creationTimeSeconds - mp4Epoch)
-	creationTime := time.Unix(unixSeconds, 0)
-
-	log.Printf("Extracted creation time from %s: %s", filepath.Base(path), creationTime.Format("2006-01-02 15:04:05"))
-
-	return creationTime, true
+	log.Printf("No 'mvhd' atom with creation time found in video file: %s", filepath.Base(path))
+	return time.Time{}, false
 }
 
 // extractAVICreationTime extracts creation time from AVI metadata
 func extractAVICreationTime(path string) (time.Time, bool) {
-	file, err := os.Open(path)
+	// AVI (RIFF) files may contain an INFO list with ICRD (creation date) or IDIT (digitization date)
+	// We scan the RIFF structure for LIST 'INFO' then look for ICRD/IDIT chunks.
+	f, err := os.Open(path)
 	if err != nil {
 		log.Printf("Error opening AVI file for metadata reading: %s: %v", filepath.Base(path), err)
 		return time.Time{}, false
 	}
-	defer file.Close()
+	defer f.Close()
 
-	// Read first part of file to look for metadata
-	buffer := make([]byte, 4096)
-	n, err := file.Read(buffer)
-	if err != nil || n < 12 {
+	header := make([]byte, 12)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return time.Time{}, false
+	}
+	if string(header[0:4]) != "RIFF" || string(header[8:12]) != "AVI " {
 		return time.Time{}, false
 	}
 
-	// Check if it's a proper AVI file (starts with RIFF and contains AVI)
-	if !bytes.HasPrefix(buffer, []byte("RIFF")) {
-		return time.Time{}, false
+	// Helper to read next chunk header
+	type chunkHeader struct {
+		id   string
+		size uint32
+		off  int64 // offset to data start
+	}
+	readChunk := func(r *os.File) (*chunkHeader, error) {
+		pos, _ := r.Seek(0, io.SeekCurrent)
+		hdr := make([]byte, 8)
+		if _, err := io.ReadFull(r, hdr); err != nil {
+			return nil, err
+		}
+		id := string(hdr[0:4])
+		size := binary.LittleEndian.Uint32(hdr[4:8])
+		return &chunkHeader{id: id, size: size, off: pos + 8}, nil
 	}
 
-	aviPos := bytes.Index(buffer[:n], []byte("AVI "))
-	if aviPos == -1 {
-		return time.Time{}, false
+	fileInfo, _ := f.Stat()
+	limit := fileInfo.Size()
+
+	// We keep a simple year extraction helper.
+	extractYear := func(text string) (int, bool) {
+		nowYear := time.Now().Year() + 1
+		for i := 0; i <= len(text)-4; i++ {
+			c0 := text[i]
+			if c0 < '1' || c0 > '2' { // years start with 19/20 typically
+				continue
+			}
+			if i+4 > len(text) {
+				break
+			}
+			yStr := text[i : i+4]
+			y, err := strconv.Atoi(yStr)
+			if err == nil && y >= 1970 && y <= nowYear {
+				return y, true
+			}
+		}
+		return 0, false
 	}
 
-	// For AVI files, creation time is more complex to extract and often not present
-	// Most AVI files don't have reliable creation time metadata
-	// This is a simplified implementation that may not work for all AVI files
-	log.Printf("AVI metadata extraction is limited - may not find creation date for %s", filepath.Base(path))
+	// Scan through chunks. We don't need to parse the whole structure strictly; a linear scan suffices.
+	// Because chunk sizes can be large, we skip over data by seeking.
+	for {
+		cur, _ := f.Seek(0, io.SeekCurrent)
+		if cur+8 >= limit { // not enough for another header
+			break
+		}
+		ch, err := readChunk(f)
+		if err != nil {
+			break
+		}
+		dataEnd := int64(ch.size) + ch.off
+		if dataEnd > limit { // malformed
+			break
+		}
+
+		if ch.id == "LIST" { // LIST chunk: next 4 bytes indicate list type
+			listType := make([]byte, 4)
+			if _, err := io.ReadFull(f, listType); err != nil {
+				break
+			}
+			listTypeStr := string(listType)
+			// INFO list contains metadata tags (ICRD, IDIT, etc.)
+			if listTypeStr == "INFO" {
+				// Parse sub-chunks within INFO region
+				// Remaining bytes in this LIST (excluding 4 bytes we just read)
+				remaining := int64(ch.size) - 4
+				for remaining > 8 { // need at least header
+					subPos, _ := f.Seek(0, io.SeekCurrent)
+					if subPos+8 > dataEnd {
+						break
+					}
+					subHdr := make([]byte, 8)
+					if _, err := io.ReadFull(f, subHdr); err != nil {
+						break
+					}
+					tag := string(subHdr[0:4])
+					sz := binary.LittleEndian.Uint32(subHdr[4:8])
+					valStart := subPos + 8
+					valEnd := valStart + int64(sz)
+					if valEnd > dataEnd { // malformed
+						break
+					}
+					// Read value (cap to reasonable size, e.g., 512 bytes)
+					readLen := sz
+					if readLen > 512 {
+						readLen = 512
+					}
+					buf := make([]byte, readLen)
+					if _, err := f.Read(buf); err != nil {
+						break
+					}
+					// Seek to end of chunk (in case we truncated read)
+					if curPos, _ := f.Seek(0, io.SeekCurrent); curPos < valEnd {
+						f.Seek(valEnd, io.SeekStart)
+					}
+					// AVI chunks are word aligned: if size is odd, skip pad byte
+					if sz%2 == 1 {
+						f.Seek(1, io.SeekCurrent)
+					}
+
+					remaining = dataEnd - (valEnd + int64(sz%2))
+
+					if tag == "ICRD" || tag == "IDIT" {
+						text := strings.Trim(string(bytes.Trim(buf, "\x00\r\n ")), " ")
+						if y, ok := extractYear(text); ok {
+							ct := time.Date(y, 1, 1, 0, 0, 0, 0, time.UTC)
+							log.Printf("Extracted creation year from AVI %s (%s=%s)", filepath.Base(path), tag, text)
+							return ct, true
+						}
+					}
+				}
+			} else {
+				// Skip rest of LIST contents
+				// We consumed 4 bytes for listType already
+				f.Seek(dataEnd, io.SeekStart)
+			}
+		} else {
+			// Skip non-LIST chunk data
+			f.Seek(dataEnd, io.SeekStart)
+		}
+
+		// Word alignment: if chunk size is odd, skip a pad byte (already included in size per spec? size excludes pad; we handled using size) -> we already advanced to dataEnd which accounts for size only; add pad if needed.
+		if ch.size%2 == 1 {
+			f.Seek(1, io.SeekCurrent)
+		}
+	}
+
+	log.Printf("No AVI creation metadata (ICRD/IDIT) found for %s", filepath.Base(path))
 	return time.Time{}, false
 }
 
