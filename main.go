@@ -65,6 +65,8 @@ func main() {
 	log.SetFlags(log.LstdFlags)
 	log.Printf("Starting media sort from '%s' to '%s'...", sourceDir, destDir)
 	log.Println("HEIC/HEIF files will be converted to JPEG.")
+	log.Println("IMPORTANT: Sorting by 'Date Taken' metadata ONLY - ignoring file system dates (modified/created)")
+	log.Println("Files without 'Date Taken' metadata will be sorted by size in 'no_date' folder")
 
 	// Check if source directory exists
 	if _, err := os.Stat(sourceDir); os.IsNotExist(err) {
@@ -185,10 +187,12 @@ func processFile(path string) {
 
 	if imageExts[ext] {
 		mediaType = "image"
+		// Extract year from EXIF "Date Taken" metadata ONLY (ignoring file system dates)
 		yearOrStatus = getExifYear(path)
 	} else if videoExts[ext] {
 		mediaType = "video"
-		yearOrStatus = "" // Videos generally don't have EXIF date
+		// Attempt to extract date from video metadata (currently not implemented)
+		yearOrStatus = getVideoDateYear(path)
 	} else if archiveExts[ext] {
 		mediaType = "archive"
 		targetFolder = archivesDir
@@ -213,7 +217,7 @@ func processFile(path string) {
 		return
 	}
 
-	// Determine target folder based on date for media files
+	// Determine target folder based on "Date Taken" metadata ONLY (ignoring file system dates)
 	if mediaType == "image" || mediaType == "video" {
 		if yearOrStatus == "error" {
 			targetFolder = errorsDir
@@ -222,14 +226,14 @@ func processFile(path string) {
 			errorCount++
 			counterMu.Unlock()
 		} else if yearOrStatus != "" && yearOrStatus != "none" {
-			// Year was successfully extracted from EXIF
+			// Year was successfully extracted from "Date Taken" metadata
 			targetFolder = filepath.Join(destDir, yearOrStatus)
-			log.Printf("Processing '%s' (%s) for year '%s'", filename, mediaType, yearOrStatus)
+			log.Printf("Processing '%s' (%s) for year '%s' (from Date Taken metadata)", filename, mediaType, yearOrStatus)
 		} else {
-			// No date found - use file size to categorize
+			// No "Date Taken" metadata found - sort by file size (ignoring file system dates)
 			sizeCat := getFileSizeCategory(path)
 			targetFolder = filepath.Join(noDateDir, sizeCat)
-			log.Printf("Processing '%s' (%s) for '%s' (no EXIF date found, sorting by size: %s)", filename, mediaType, filepath.Join("no_date", sizeCat), sizeCat)
+			log.Printf("Processing '%s' (%s) for '%s' (no Date Taken metadata found, ignoring file dates, sorting by size: %s)", filename, mediaType, filepath.Join("no_date", sizeCat), sizeCat)
 			counterMu.Lock()
 			noDateCount++
 			counterMu.Unlock()
@@ -311,7 +315,8 @@ func getFileSizeCategory(path string) string {
 	}
 }
 
-// getExifYear tries to extract the year from EXIF metadata with optimizations
+// getExifYear tries to extract the year from EXIF "Date Taken" metadata ONLY
+// This function explicitly ignores file system dates (modified/created) and only uses camera metadata
 func getExifYear(path string) string {
 	ext := strings.ToLower(filepath.Ext(path))
 	
@@ -337,19 +342,36 @@ func getExifYear(path string) string {
 		return ""
 	}
 
-	// Try DateTimeOriginal first (most reliable) - this is the most common tag
+	// Priority order for EXIF date tags (most reliable first):
+	// 1. DateTimeOriginal - when the photo was taken (most reliable)
+	// 2. DateTimeDigitized - when the photo was digitized
+	// 3. DateTime - when the file was last modified (least reliable, but still EXIF)
+	
+	// Try DateTimeOriginal first (most reliable) - this is the actual "date taken"
 	if tag, err := x.Get(exif.DateTimeOriginal); err == nil {
 		if dateStr, err := tag.StringVal(); err == nil && len(dateStr) >= 4 {
 			if year := extractYearFromDateString(dateStr); year != "" {
+				log.Printf("Found DateTimeOriginal for %s: %s", filepath.Base(path), year)
 				return year
 			}
 		}
 	}
 
-	// Try DateTime() method as fallback
+	// Try DateTimeDigitized as second choice
+	if tag, err := x.Get(exif.DateTimeDigitized); err == nil {
+		if dateStr, err := tag.StringVal(); err == nil && len(dateStr) >= 4 {
+			if year := extractYearFromDateString(dateStr); year != "" {
+				log.Printf("Found DateTimeDigitized for %s: %s", filepath.Base(path), year)
+				return year
+			}
+		}
+	}
+
+	// Try DateTime() method as fallback (this tries multiple tags internally)
 	if dt, err := x.DateTime(); err == nil {
 		year := dt.Year()
 		if year > 1900 && year <= time.Now().Year()+1 {
+			log.Printf("Found DateTime method for %s: %d", filepath.Base(path), year)
 			return strconv.Itoa(year)
 		}
 	}
@@ -358,11 +380,14 @@ func getExifYear(path string) string {
 	if tag, err := x.Get(exif.DateTime); err == nil {
 		if dateStr, err := tag.StringVal(); err == nil && len(dateStr) >= 4 {
 			if year := extractYearFromDateString(dateStr); year != "" {
+				log.Printf("Found DateTime tag for %s: %s", filepath.Base(path), year)
 				return year
 			}
 		}
 	}
 
+	// Explicitly log that we found no EXIF date (ignoring file system dates)
+	log.Printf("No EXIF date metadata found for %s (ignoring file system dates)", filepath.Base(path))
 	return ""
 }
 
@@ -380,6 +405,15 @@ func extractYearFromDateString(dateStr string) string {
 			}
 		}
 	}
+	return ""
+}
+
+// getVideoDateYear attempts to extract date from video metadata (placeholder for future enhancement)
+// Currently returns empty as video date extraction requires additional libraries
+func getVideoDateYear(path string) string {
+	// TODO: Implement video metadata reading using ffmpeg or similar
+	// For now, videos go to no_date folder as they rarely have easily accessible date metadata
+	log.Printf("Video files currently go to no_date folder: %s (video date extraction not implemented)", filepath.Base(path))
 	return ""
 }
 
@@ -571,13 +605,14 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-// printSummary prints the final summary like the Python script
+// printSummary prints the final summary with emphasis on date handling approach
 func printSummary() {
 	log.Println("--- Sorting Summary ---")
-	log.Printf("Photos moved/converted to year folders: %d", movedCount)
-	log.Printf("Videos moved to year folders: %d", videoMovedCount)
+	log.Println("NOTE: All sorting was based on 'Date Taken' metadata only (file system dates ignored)")
+	log.Printf("Photos moved/converted to year folders (by Date Taken): %d", movedCount)
+	log.Printf("Videos moved to year folders (by metadata): %d", videoMovedCount)
 	log.Printf("HEIC files converted to JPEG: %d", heicConvertedCount)
-	log.Printf("Media files moved to 'no_date' subfolders (no EXIF date, sorted by size): %d", noDateCount)
+	log.Printf("Media files moved to 'no_date' subfolders (no Date Taken metadata, sorted by size): %d", noDateCount)
 	log.Printf("Archive files moved to 'archives': %d", archiveMovedCount)
 	log.Printf("Non-media files deleted: %d", deletedNonMediaCount)
 	log.Printf("Files moved to 'errors' due to errors: %d", errorCount)
@@ -585,6 +620,7 @@ func printSummary() {
 	log.Printf("Duplicate files deleted from source: %d", duplicateDeletedCount)
 	log.Println("------------------------")
 	log.Println("Media sorting process finished.")
+	log.Println("All files were sorted by 'Date Taken' metadata - file system dates were ignored.")
 }
 
 // cleanupEmptyDirectories recursively removes empty directories in the source path
