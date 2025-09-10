@@ -7,8 +7,8 @@ A Go application to automatically sort photos and videos from an input directory
 ## Features
 
 *   **Concurrent Processing:** Uses multiple goroutines (4 workers) for faster file processing.
-*   **Year-based Sorting:** Sorts images based on EXIF 'Date Taken' metadata (year) into `sorted_photos/YYYY` folders.
-*   **Extension-based Categorization:** Places videos and images without valid EXIF date into `no_date` subfolders organized by file extension.
+*   **Year-based Sorting:** Sorts images based on EXIF 'Date Taken' metadata and videos based on 'Media Created' metadata (year) into `sorted_photos/YYYY` folders.
+*   **Extension-based Categorization:** Places videos and images without valid metadata into `no_date` subfolders organized by file extension.
 *   **Multiple File Types:** Supports common image formats (JPG, JPEG, PNG, GIF, TIFF, BMP, HEIC, HEIF) and video formats (MP4, AVI, MOV, WMV, MKV, FLV, MPEG, MPG, M4V).
 *   **Archive Handling:** Automatically extracts ZIP archives and processes their contents. Other archive formats (RAR, 7Z, TAR, etc.) are moved to a dedicated `archives` folder.
 *   **HEIC/HEIF Support:** Converts `.heic` and `.heif` files to JPEG format (currently placeholder - requires external tool like ImageMagick).

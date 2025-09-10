@@ -2,7 +2,9 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -19,8 +21,6 @@ import (
 	"github.com/rwcarlsen/goexif/exif"
 )
 
-// TODO: Add EXIF and HEIC support imports
-
 var (
 	imageExts   = map[string]bool{".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".tiff": true, ".bmp": true, ".heic": true, ".heif": true}
 	videoExts   = map[string]bool{".mp4": true, ".avi": true, ".mov": true, ".wmv": true, ".mkv": true, ".flv": true, ".mpeg": true, ".mpg": true, ".m4v": true}
@@ -29,18 +29,18 @@ var (
 )
 
 var (
-	scriptDir, _   = filepath.Abs(filepath.Dir(os.Args[0]))
-	sourceDir      = filepath.Join(scriptDir, "unsorted_photos")
-	destDir        = filepath.Join(scriptDir, "sorted_photos")
-	noDateDir      = filepath.Join(destDir, "no_date")
-	archivesDir    = filepath.Join(destDir, "archives")
-	errorsDir      = filepath.Join(destDir, "errors")
+	scriptDir, _ = os.Getwd() // Use current working directory instead of binary location
+	sourceDir    = filepath.Join(scriptDir, "unsorted_photos")
+	destDir      = filepath.Join(scriptDir, "sorted_photos")
+	noDateDir    = filepath.Join(destDir, "no_date")
+	archivesDir  = filepath.Join(destDir, "archives")
+	errorsDir    = filepath.Join(destDir, "errors")
 )
 
 var (
 	hashMu              sync.Mutex
 	hashesInDestination = make(map[string]map[string]bool, 20) // Pre-allocate with estimated year folders
-	
+
 	// Cache for directories that have been created to avoid repeated MkdirAll calls
 	createdDirsMu sync.RWMutex
 	createdDirs   = make(map[string]bool, 50) // Pre-allocate for common directories
@@ -48,27 +48,27 @@ var (
 
 // Counters
 var (
-	counterMu               sync.Mutex
-	movedCount              int
-	videoMovedCount         int
-	heicConvertedCount      int
-	noDateCount             int
-	archiveMovedCount       int
-	archiveExtractedCount   int // New counter for extracted archives
-	deletedNonMediaCount    int
-	errorCount              int
-	skippedCount            int
-	duplicateDeletedCount   int
-	totalFiles              int64 // Track total files for progress
-	processedFiles          int64 // Track processed files for progress
+	counterMu             sync.Mutex
+	movedCount            int
+	videoMovedCount       int
+	heicConvertedCount    int
+	noDateCount           int
+	archiveMovedCount     int
+	archiveExtractedCount int // New counter for extracted archives
+	deletedNonMediaCount  int
+	errorCount            int
+	skippedCount          int
+	duplicateDeletedCount int
+	totalFiles            int64 // Track total files for progress
+	processedFiles        int64 // Track processed files for progress
 )
 
 func main() {
 	log.SetFlags(log.LstdFlags)
 	log.Printf("Starting media sort from '%s' to '%s'...", sourceDir, destDir)
 	log.Println("HEIC/HEIF files will be converted to JPEG.")
-	log.Println("IMPORTANT: Sorting by 'Date Taken' metadata ONLY - ignoring file system dates (modified/created)")
-	log.Println("Files without 'Date Taken' metadata will be sorted by extension in 'no_date' folder")
+	log.Println("IMPORTANT: Sorting by 'Date Taken' metadata for photos and 'Media Created' metadata for videos - ignoring file system dates")
+	log.Println("Files without metadata will be sorted by extension in 'no_date' folder")
 	log.Println("ZIP archives will be extracted and contents processed automatically")
 
 	// Check if source directory exists
@@ -114,7 +114,7 @@ func main() {
 		if info.IsDir() {
 			return nil
 		}
-		
+
 		// Skip files that might already be in a destination structure
 		if strings.Contains(path, destDir) {
 			log.Printf("Skipping file already in destination structure: %s", path)
@@ -123,12 +123,12 @@ func main() {
 			counterMu.Unlock()
 			return nil
 		}
-		
+
 		fileCount++
 		fileChan <- path
 		return nil
 	})
-	
+
 	// Set total files for progress tracking
 	atomic.StoreInt64(&totalFiles, fileCount)
 	log.Printf("Found %d files to process", fileCount)
@@ -137,10 +137,10 @@ func main() {
 	}
 	close(fileChan)
 	wg.Wait()
-	
+
 	// Clean up empty directories in source
 	cleanupEmptyDirectories(sourceDir)
-	
+
 	// Print summary
 	printSummary()
 }
@@ -154,20 +154,20 @@ func ensureDir(dir string) error {
 		return nil
 	}
 	createdDirsMu.RUnlock()
-	
+
 	// Not in cache, acquire write lock and create directory
 	createdDirsMu.Lock()
 	defer createdDirsMu.Unlock()
-	
+
 	// Double-check in case another goroutine created it
 	if createdDirs[dir] {
 		return nil
 	}
-	
+
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	
+
 	createdDirs[dir] = true
 	return nil
 }
@@ -181,7 +181,7 @@ func processFile(path string) {
 			log.Printf("Progress: %d/%d files processed (%.1f%%)", processed, total, float64(processed)/float64(total)*100)
 		}
 	}()
-	
+
 	ext := strings.ToLower(filepath.Ext(path))
 	filename := filepath.Base(path)
 	var targetFolder string
@@ -194,7 +194,7 @@ func processFile(path string) {
 		yearOrStatus = getExifYear(path)
 	} else if videoExts[ext] {
 		mediaType = "video"
-		// Attempt to extract date from video metadata (currently not implemented)
+		// Extract year from video "Media Created" metadata (ignoring file system dates)
 		yearOrStatus = getVideoDateYear(path)
 	} else if archiveExts[ext] {
 		mediaType = "archive"
@@ -234,7 +234,7 @@ func processFile(path string) {
 		return
 	}
 
-	// Determine target folder based on "Date Taken" metadata ONLY (ignoring file system dates)
+	// Determine target folder based on metadata (Date Taken for images, Media Created for videos)
 	if mediaType == "image" || mediaType == "video" {
 		if yearOrStatus == "error" {
 			targetFolder = errorsDir
@@ -243,14 +243,22 @@ func processFile(path string) {
 			errorCount++
 			counterMu.Unlock()
 		} else if yearOrStatus != "" && yearOrStatus != "none" {
-			// Year was successfully extracted from "Date Taken" metadata
+			// Year was successfully extracted from metadata
 			targetFolder = filepath.Join(destDir, yearOrStatus)
-			log.Printf("Processing '%s' (%s) for year '%s' (from Date Taken metadata)", filename, mediaType, yearOrStatus)
+			if mediaType == "image" {
+				log.Printf("Processing '%s' (%s) for year '%s' (from Date Taken metadata)", filename, mediaType, yearOrStatus)
+			} else {
+				log.Printf("Processing '%s' (%s) for year '%s' (from Media Created metadata)", filename, mediaType, yearOrStatus)
+			}
 		} else {
-			// No "Date Taken" metadata found - sort by file extension (ignoring file system dates)
+			// No metadata found - sort by file extension (ignoring file system dates)
 			extCat := getFileExtensionCategory(path)
 			targetFolder = filepath.Join(noDateDir, extCat)
-			log.Printf("Processing '%s' (%s) for '%s' (no Date Taken metadata found, ignoring file dates, sorting by extension: %s)", filename, mediaType, filepath.Join("no_date", extCat), extCat)
+			if mediaType == "image" {
+				log.Printf("Processing '%s' (%s) for '%s' (no Date Taken metadata found, ignoring file dates, sorting by extension: %s)", filename, mediaType, filepath.Join("no_date", extCat), extCat)
+			} else {
+				log.Printf("Processing '%s' (%s) for '%s' (no Media Created metadata found, ignoring file dates, sorting by extension: %s)", filename, mediaType, filepath.Join("no_date", extCat), extCat)
+			}
 			counterMu.Lock()
 			noDateCount++
 			counterMu.Unlock()
@@ -308,6 +316,7 @@ func processFile(path string) {
 		moveFile(path, targetFolder, filename, hash, mediaType)
 	}
 }
+
 // getFileExtensionCategory categorizes files by extension for no_date sorting
 func getFileExtensionCategory(path string) string {
 	ext := strings.ToLower(filepath.Ext(path))
@@ -322,7 +331,7 @@ func getFileExtensionCategory(path string) string {
 // This function explicitly ignores file system dates (modified/created) and only uses camera metadata
 func getExifYear(path string) string {
 	ext := strings.ToLower(filepath.Ext(path))
-	
+
 	// Only try EXIF for formats that commonly have it (skip PNG, GIF, BMP for performance)
 	if ext != ".jpg" && ext != ".jpeg" && ext != ".tiff" && ext != ".heic" && ext != ".heif" {
 		return ""
@@ -349,7 +358,7 @@ func getExifYear(path string) string {
 	// 1. DateTimeOriginal - when the photo was taken (most reliable)
 	// 2. DateTimeDigitized - when the photo was digitized
 	// 3. DateTime - when the file was last modified (least reliable, but still EXIF)
-	
+
 	// Try DateTimeOriginal first (most reliable) - this is the actual "date taken"
 	if tag, err := x.Get(exif.DateTimeOriginal); err == nil {
 		if dateStr, err := tag.StringVal(); err == nil && len(dateStr) >= 4 {
@@ -411,13 +420,146 @@ func extractYearFromDateString(dateStr string) string {
 	return ""
 }
 
-// getVideoDateYear attempts to extract date from video metadata (placeholder for future enhancement)
-// Currently returns empty as video date extraction requires additional libraries
+// getVideoDateYear attempts to extract the media creation date from video metadata
+// This reads the "media created" timestamp from video file metadata, NOT file system dates
 func getVideoDateYear(path string) string {
-	// TODO: Implement video metadata reading using ffmpeg or similar
-	// For now, videos go to no_date folder as they rarely have easily accessible date metadata
-	log.Printf("Video files currently go to no_date folder: %s (video date extraction not implemented)", filepath.Base(path))
+	ext := strings.ToLower(filepath.Ext(path))
+	filename := filepath.Base(path)
+
+	log.Printf("Attempting to extract video metadata for: %s (extension: %s)", filename, ext)
+
+	var creationTime time.Time
+	var found bool
+
+	switch ext {
+	case ".mp4", ".m4v", ".mov":
+		// Try to read QuickTime/MP4 creation time from metadata
+		log.Printf("Processing MP4/MOV file: %s", filename)
+		creationTime, found = extractMP4CreationTime(path)
+	case ".avi":
+		// Try to read AVI creation time from metadata
+		log.Printf("Processing AVI file: %s", filename)
+		creationTime, found = extractAVICreationTime(path)
+	default:
+		// For other video formats, we currently can't extract metadata
+		log.Printf("Video metadata extraction not supported for format '%s': %s", ext, filename)
+		return ""
+	}
+
+	if found {
+		year := creationTime.Year()
+		if year > 1900 && year <= time.Now().Year()+1 {
+			log.Printf("✓ Found media creation date for %s: %d", filename, year)
+			return strconv.Itoa(year)
+		} else {
+			log.Printf("⚠ Invalid media creation year (%d) for %s, treating as no date", year, filename)
+			return ""
+		}
+	}
+
+	log.Printf("✗ No media creation date found in metadata for %s", filename)
 	return ""
+}
+
+// extractMP4CreationTime extracts creation time from MP4/MOV/M4V metadata
+func extractMP4CreationTime(path string) (time.Time, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Printf("Error opening video file for metadata reading: %s: %v", filepath.Base(path), err)
+		return time.Time{}, false
+	}
+	defer file.Close()
+
+	// Read more of the file to find metadata atoms (many MP4s have mvhd deeper in the file)
+	buffer := make([]byte, 65536) // Read first 64KB
+	n, err := file.Read(buffer)
+	if err != nil || n < 8 {
+		log.Printf("Failed to read enough data from video file: %s", filepath.Base(path))
+		return time.Time{}, false
+	}
+
+	// Look for 'moov' atom first, then 'mvhd' within it
+	moovPos := bytes.Index(buffer[:n], []byte("moov"))
+	if moovPos == -1 {
+		log.Printf("No 'moov' atom found in video file: %s", filepath.Base(path))
+		return time.Time{}, false
+	}
+
+	// Look for 'mvhd' (movie header) atom after the moov atom
+	searchStart := moovPos
+	mvhdPos := bytes.Index(buffer[searchStart:n], []byte("mvhd"))
+	if mvhdPos == -1 {
+		log.Printf("No 'mvhd' atom found in video file: %s", filepath.Base(path))
+		return time.Time{}, false
+	}
+
+	// Adjust mvhdPos to be relative to the entire buffer
+	mvhdPos += searchStart
+
+	// Check if we have enough data for the creation time
+	if mvhdPos+12 >= n {
+		log.Printf("Not enough data after mvhd atom in video file: %s", filepath.Base(path))
+		return time.Time{}, false
+	}
+
+	// Read 4 bytes for creation time (big-endian uint32)
+	// Creation time is at offset +4 from 'mvhd' atom
+	creationTimeBytes := buffer[mvhdPos+4 : mvhdPos+8]
+	creationTimeSeconds := binary.BigEndian.Uint32(creationTimeBytes)
+
+	log.Printf("Raw creation time from %s: %d", filepath.Base(path), creationTimeSeconds)
+
+	// MP4 time is seconds since January 1, 1904 (not Unix epoch)
+	// Convert to Unix time by subtracting the difference
+	const mp4Epoch = 2082844800 // Seconds between 1904-01-01 and 1970-01-01
+	if creationTimeSeconds == 0 {
+		log.Printf("Creation time is zero in video file: %s", filepath.Base(path))
+		return time.Time{}, false
+	}
+	if creationTimeSeconds < mp4Epoch {
+		log.Printf("Creation time (%d) is before MP4 epoch in video file: %s", creationTimeSeconds, filepath.Base(path))
+		return time.Time{}, false
+	}
+
+	unixSeconds := int64(creationTimeSeconds - mp4Epoch)
+	creationTime := time.Unix(unixSeconds, 0)
+
+	log.Printf("Extracted creation time from %s: %s", filepath.Base(path), creationTime.Format("2006-01-02 15:04:05"))
+
+	return creationTime, true
+}
+
+// extractAVICreationTime extracts creation time from AVI metadata
+func extractAVICreationTime(path string) (time.Time, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Printf("Error opening AVI file for metadata reading: %s: %v", filepath.Base(path), err)
+		return time.Time{}, false
+	}
+	defer file.Close()
+
+	// Read first part of file to look for metadata
+	buffer := make([]byte, 4096)
+	n, err := file.Read(buffer)
+	if err != nil || n < 12 {
+		return time.Time{}, false
+	}
+
+	// Check if it's a proper AVI file (starts with RIFF and contains AVI)
+	if !bytes.HasPrefix(buffer, []byte("RIFF")) {
+		return time.Time{}, false
+	}
+
+	aviPos := bytes.Index(buffer[:n], []byte("AVI "))
+	if aviPos == -1 {
+		return time.Time{}, false
+	}
+
+	// For AVI files, creation time is more complex to extract and often not present
+	// Most AVI files don't have reliable creation time metadata
+	// This is a simplified implementation that may not work for all AVI files
+	log.Printf("AVI metadata extraction is limited - may not find creation date for %s", filepath.Base(path))
+	return time.Time{}, false
 }
 
 // extractArchive attempts to extract an archive and process its contents
@@ -425,12 +567,12 @@ func getVideoDateYear(path string) string {
 func extractArchive(archivePath string) bool {
 	ext := strings.ToLower(filepath.Ext(archivePath))
 	filename := filepath.Base(archivePath)
-	
+
 	// Create temporary extraction directory
 	tempDir := filepath.Join(filepath.Dir(archivePath), "temp_extract_"+strings.TrimSuffix(filename, ext))
-	
+
 	var extractSuccess bool
-	
+
 	switch ext {
 	case ".zip":
 		extractSuccess = extractZip(archivePath, tempDir)
@@ -439,13 +581,13 @@ func extractArchive(archivePath string) bool {
 		log.Printf("Archive type '%s' not supported for extraction: %s", ext, filename)
 		return false
 	}
-	
+
 	if !extractSuccess {
 		// Clean up temp directory if extraction failed
 		os.RemoveAll(tempDir)
 		return false
 	}
-	
+
 	// Process extracted files
 	log.Printf("Processing extracted files from '%s'...", filename)
 	err := filepath.Walk(tempDir, func(path string, info os.FileInfo, err error) error {
@@ -456,22 +598,22 @@ func extractArchive(archivePath string) bool {
 		if info.IsDir() {
 			return nil
 		}
-		
+
 		// Process each extracted file as if it was in the original source
 		processFile(path)
 		return nil
 	})
-	
+
 	// Clean up temporary extraction directory
 	if err := os.RemoveAll(tempDir); err != nil {
 		log.Printf("Warning: Could not clean up temporary extraction directory '%s': %v", tempDir, err)
 	}
-	
+
 	if err != nil {
 		log.Printf("Error processing extracted files from '%s': %v", filename, err)
 		return false
 	}
-	
+
 	return true
 }
 
@@ -483,36 +625,36 @@ func extractZip(zipPath, destDir string) bool {
 		return false
 	}
 	defer reader.Close()
-	
+
 	// Create destination directory
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		log.Printf("Error creating extraction directory '%s': %v", destDir, err)
 		return false
 	}
-	
+
 	// Extract each file
 	for _, file := range reader.File {
 		// Skip directories
 		if file.FileInfo().IsDir() {
 			continue
 		}
-		
+
 		// Create the file path
 		filePath := filepath.Join(destDir, file.Name)
-		
+
 		// Create directory structure if needed
 		if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
 			log.Printf("Error creating directory structure for '%s': %v", file.Name, err)
 			continue
 		}
-		
+
 		// Open the file in the ZIP
 		rc, err := file.Open()
 		if err != nil {
 			log.Printf("Error opening file '%s' in ZIP: %v", file.Name, err)
 			continue
 		}
-		
+
 		// Create the destination file
 		outFile, err := os.Create(filePath)
 		if err != nil {
@@ -520,21 +662,21 @@ func extractZip(zipPath, destDir string) bool {
 			rc.Close()
 			continue
 		}
-		
+
 		// Copy the file contents
 		_, err = io.Copy(outFile, rc)
 		outFile.Close()
 		rc.Close()
-		
+
 		if err != nil {
 			log.Printf("Error extracting file '%s': %v", file.Name, err)
 			os.Remove(filePath) // Clean up partially extracted file
 			continue
 		}
-		
+
 		log.Printf("Extracted: %s", file.Name)
 	}
-	
+
 	return true
 }
 
@@ -546,13 +688,13 @@ func convertHEIC(sourcePath, targetFolder, hash string) {
 	stem := strings.TrimSuffix(filename, filepath.Ext(filename))
 	outputFilename := stem + ".jpg"
 	destPath := filepath.Join(targetFolder, outputFilename)
-	
+
 	counter := 1
 	for {
 		if _, err := os.Stat(destPath); os.IsNotExist(err) {
 			break // File doesn't exist, we can use this name
 		}
-		
+
 		// Check if existing file has same hash
 		existingHash, err := fileHash(destPath)
 		if err == nil && existingHash == hash {
@@ -569,16 +711,16 @@ func convertHEIC(sourcePath, targetFolder, hash string) {
 			}
 			return
 		}
-		
+
 		// Rename the output
 		newName := fmt.Sprintf("%s_%d.jpg", stem, counter)
 		destPath = filepath.Join(targetFolder, newName)
 		counter++
 		log.Printf("Filename conflict for converted JPEG: Renaming output to '%s' in '%s'", newName, filepath.Base(targetFolder))
 	}
-	
+
 	log.Printf("Converting '%s' to '%s'...", filename, filepath.Base(destPath))
-	
+
 	// TODO: Implement actual HEIC to JPEG conversion using ImageMagick or similar
 	// For now, just copy the file as-is (this is a placeholder)
 	if err := copyFile(sourcePath, destPath); err != nil {
@@ -586,7 +728,7 @@ func convertHEIC(sourcePath, targetFolder, hash string) {
 		counterMu.Lock()
 		errorCount++
 		counterMu.Unlock()
-		
+
 		// Move to error folder
 		errorDest := filepath.Join(errorsDir, filename)
 		if err := copyFile(sourcePath, errorDest); err != nil {
@@ -597,16 +739,16 @@ func convertHEIC(sourcePath, targetFolder, hash string) {
 		}
 		return
 	}
-	
+
 	counterMu.Lock()
 	heicConvertedCount++
 	counterMu.Unlock()
-	
+
 	// Delete original HEIC after successful conversion
 	if err := os.Remove(sourcePath); err != nil {
 		log.Printf("Could not delete original HEIC '%s' after conversion: %v", sourcePath, err)
 	}
-	
+
 	// Record hash in destination set
 	hashMu.Lock()
 	if hashesInDestination[targetFolder] == nil {
@@ -614,7 +756,7 @@ func convertHEIC(sourcePath, targetFolder, hash string) {
 	}
 	hashesInDestination[targetFolder][hash] = true
 	hashMu.Unlock()
-	
+
 	// Increment appropriate counter
 	if strings.Contains(targetFolder, "no_date") {
 		// no_date_count already incremented
@@ -629,12 +771,12 @@ func convertHEIC(sourcePath, targetFolder, hash string) {
 func moveFile(sourcePath, targetFolder, filename, hash, mediaType string) {
 	destPath := filepath.Join(targetFolder, filename)
 	counter := 1
-	
+
 	for {
 		if _, err := os.Stat(destPath); os.IsNotExist(err) {
 			break // File doesn't exist, we can use this name
 		}
-		
+
 		// Check if existing file has same hash
 		existingHash, err := fileHash(destPath)
 		if err == nil && existingHash == hash {
@@ -651,7 +793,7 @@ func moveFile(sourcePath, targetFolder, filename, hash, mediaType string) {
 			}
 			return
 		}
-		
+
 		// Rename file being moved
 		ext := filepath.Ext(filename)
 		stem := strings.TrimSuffix(filename, ext)
@@ -660,7 +802,7 @@ func moveFile(sourcePath, targetFolder, filename, hash, mediaType string) {
 		counter++
 		log.Printf("Filename conflict: Renaming '%s' to '%s' in '%s'", filename, newName, filepath.Base(targetFolder))
 	}
-	
+
 	// Perform the move
 	if err := os.Rename(sourcePath, destPath); err != nil {
 		// If rename fails, try copy and delete
@@ -673,11 +815,12 @@ func moveFile(sourcePath, targetFolder, filename, hash, mediaType string) {
 		}
 		os.Remove(sourcePath)
 	}
-	
+
 	log.Printf("Successfully moved '%s' to '%s'", filename, destPath)
-	
+
 	// Increment appropriate counter
-	if mediaType == "video" {
+	switch mediaType {
+	case "video":
 		if strings.Contains(targetFolder, "no_date") {
 			// no_date_count already incremented
 		} else if targetFolder != errorsDir {
@@ -685,7 +828,7 @@ func moveFile(sourcePath, targetFolder, filename, hash, mediaType string) {
 			videoMovedCount++
 			counterMu.Unlock()
 		}
-	} else if mediaType == "image" {
+	case "image":
 		if strings.Contains(targetFolder, "no_date") {
 			// no_date_count already incremented
 		} else if targetFolder != errorsDir {
@@ -694,7 +837,7 @@ func moveFile(sourcePath, targetFolder, filename, hash, mediaType string) {
 			counterMu.Unlock()
 		}
 	}
-	
+
 	// Record hash in destination set
 	if hash != "" {
 		hashMu.Lock()
@@ -713,13 +856,13 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer srcFile.Close()
-	
+
 	dstFile, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
 	defer dstFile.Close()
-	
+
 	// Use a larger buffer for better performance
 	buf := make([]byte, 64*1024) // 64KB buffer
 	_, err = io.CopyBuffer(dstFile, srcFile, buf)
@@ -730,25 +873,25 @@ func copyFile(src, dst string) error {
 func printSummary() {
 	totalProcessed := atomic.LoadInt64(&processedFiles)
 	totalFound := atomic.LoadInt64(&totalFiles)
-	
+
 	log.Println("")
 	log.Println("═══════════════════════════════════════════════════════════════")
 	log.Println("                    📊 PHOTO SORTING COMPLETE 📊")
 	log.Println("═══════════════════════════════════════════════════════════════")
 	log.Println("")
-	
+
 	// File Processing Summary
 	log.Println("📁 FILE PROCESSING SUMMARY:")
 	log.Printf("   • Total files found: %d", totalFound)
 	log.Printf("   • Total files processed: %d", totalProcessed)
 	log.Printf("   • Processing completion: %.1f%%", float64(totalProcessed)/float64(totalFound)*100)
 	log.Println("")
-	
+
 	// Successful Operations
 	log.Println("✅ SUCCESSFUL OPERATIONS:")
 	successfulOps := movedCount + videoMovedCount + heicConvertedCount + noDateCount + archiveExtractedCount + archiveMovedCount
 	log.Printf("   📷 Photos sorted by Date Taken: %d", movedCount)
-	log.Printf("   🎬 Videos sorted by metadata: %d", videoMovedCount)
+	log.Printf("   🎬 Videos sorted by Media Created: %d", videoMovedCount)
 	log.Printf("   🔄 HEIC/HEIF files converted to JPEG: %d", heicConvertedCount)
 	log.Printf("   📂 Files sorted by extension (no date): %d", noDateCount)
 	log.Printf("   📦 ZIP archives extracted & processed: %d", archiveExtractedCount)
@@ -756,7 +899,7 @@ func printSummary() {
 	log.Printf("   🗑️  Non-media files deleted: %d", deletedNonMediaCount)
 	log.Printf("   ➡️  Total successful operations: %d", successfulOps)
 	log.Println("")
-	
+
 	// Issues and Cleanup
 	issueCount := errorCount + duplicateDeletedCount + skippedCount
 	if issueCount > 0 {
@@ -773,16 +916,16 @@ func printSummary() {
 		log.Printf("   📊 Total issues handled: %d", issueCount)
 		log.Println("")
 	}
-	
+
 	// Performance Stats
 	log.Println("⚡ PERFORMANCE & SETTINGS:")
 	log.Printf("   🔧 Worker goroutines used: %d", runtime.NumCPU()*2)
-	log.Printf("   📋 Sorting method: Date Taken metadata only")
+	log.Printf("   📋 Sorting method: Date Taken (photos) & Media Created (videos)")
 	log.Printf("   🚫 File system dates: Ignored")
 	log.Printf("   📁 Extension-based sorting: Enabled for no-date files")
 	log.Printf("   📦 ZIP auto-extraction: Enabled")
 	log.Println("")
-	
+
 	// Directory Locations
 	log.Println("📍 OUTPUT LOCATIONS:")
 	log.Printf("   📂 Sorted photos: %s", destDir)
@@ -792,16 +935,16 @@ func printSummary() {
 		log.Printf("   ❌ Error files: %s", errorsDir)
 	}
 	log.Println("")
-	
+
 	// Final Status
 	if errorCount > 0 {
 		log.Println("⚠️  COMPLETED WITH ISSUES - Check the 'errors' folder for problematic files")
 	} else {
 		log.Println("🎉 COMPLETED SUCCESSFULLY - All files processed without errors!")
 	}
-	
+
 	log.Println("═══════════════════════════════════════════════════════════════")
-	log.Printf("📋 IMPORTANT: All sorting based on 'Date Taken' metadata only")
+	log.Printf("📋 IMPORTANT: Photos sorted by 'Date Taken' metadata, Videos by 'Media Created' metadata")
 	log.Printf("🔍 Review your sorted files in: %s", destDir)
 	log.Println("═══════════════════════════════════════════════════════════════")
 }
@@ -810,18 +953,18 @@ func printSummary() {
 func cleanupEmptyDirectories(basePath string) {
 	log.Printf("Cleaning up empty directories in '%s'...", basePath)
 	deletedDirs := 0
-	
+
 	// We need to do multiple passes because removing a directory might make its parent empty
 	for {
 		dirsBefore := deletedDirs
 		deletedDirs += removeEmptyDirsPass(basePath)
-		
+
 		// If no directories were deleted in this pass, we're done
 		if deletedDirs == dirsBefore {
 			break
 		}
 	}
-	
+
 	if deletedDirs > 0 {
 		log.Printf("Deleted %d empty directories", deletedDirs)
 	} else {
@@ -833,23 +976,23 @@ func cleanupEmptyDirectories(basePath string) {
 // Returns the number of directories deleted in this pass
 func removeEmptyDirsPass(basePath string) int {
 	deletedCount := 0
-	
+
 	err := filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("Error accessing %s: %v", path, err)
 			return nil // Continue walking despite errors
 		}
-		
+
 		// Skip the base directory itself
 		if path == basePath {
 			return nil
 		}
-		
+
 		// Only process directories
 		if !info.IsDir() {
 			return nil
 		}
-		
+
 		// Check if directory is empty
 		if isDirEmpty(path) {
 			if err := os.Remove(path); err != nil {
@@ -859,14 +1002,14 @@ func removeEmptyDirsPass(basePath string) int {
 				deletedCount++
 			}
 		}
-		
+
 		return nil
 	})
-	
+
 	if err != nil {
 		log.Printf("Error during directory cleanup: %v", err)
 	}
-	
+
 	return deletedCount
 }
 
@@ -887,7 +1030,7 @@ func fileHash(path string) (string, error) {
 		return "", err
 	}
 	defer f.Close()
-	
+
 	h := sha256.New()
 	// Use a larger buffer for better performance on large files
 	buf := make([]byte, 64*1024) // 64KB buffer
