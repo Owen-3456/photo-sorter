@@ -8,9 +8,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rwcarlsen/goexif/exif"
@@ -36,7 +38,11 @@ var (
 
 var (
 	hashMu              sync.Mutex
-	hashesInDestination = make(map[string]map[string]bool) // folder -> hash set
+	hashesInDestination = make(map[string]map[string]bool, 20) // Pre-allocate with estimated year folders
+	
+	// Cache for directories that have been created to avoid repeated MkdirAll calls
+	createdDirsMu sync.RWMutex
+	createdDirs   = make(map[string]bool, 50) // Pre-allocate for common directories
 )
 
 // Counters
@@ -51,6 +57,8 @@ var (
 	errorCount              int
 	skippedCount            int
 	duplicateDeletedCount   int
+	totalFiles              int64 // Track total files for progress
+	processedFiles          int64 // Track processed files for progress
 )
 
 func main() {
@@ -72,10 +80,14 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
-	fileChan := make(chan string, 100)
+	fileChan := make(chan string, 1000) // Increased buffer size for better throughput
 
-	// Start worker goroutines (reduce from 8 to match Python's sequential processing more closely)
-	numWorkers := 4
+	// Use more workers based on CPU cores for better performance
+	numWorkers := runtime.NumCPU() * 2 // Use 2x CPU cores for I/O bound operations
+	if numWorkers < 4 {
+		numWorkers = 4 // Minimum 4 workers
+	}
+	log.Printf("Using %d worker goroutines for processing", numWorkers)
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
@@ -87,6 +99,8 @@ func main() {
 	}
 
 	// Walk the source directory and send files to workers
+	log.Println("Scanning files...")
+	var fileCount int64
 	err := filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("Error walking %s: %v", path, err)
@@ -105,9 +119,14 @@ func main() {
 			return nil
 		}
 		
+		fileCount++
 		fileChan <- path
 		return nil
 	})
+	
+	// Set total files for progress tracking
+	atomic.StoreInt64(&totalFiles, fileCount)
+	log.Printf("Found %d files to process", fileCount)
 	if err != nil {
 		log.Fatalf("Failed to walk source directory: %v", err)
 	}
@@ -121,7 +140,43 @@ func main() {
 	printSummary()
 }
 
+// ensureDir creates a directory if it doesn't exist, using a cache to avoid repeated checks
+func ensureDir(dir string) error {
+	// Check cache first (read lock)
+	createdDirsMu.RLock()
+	if createdDirs[dir] {
+		createdDirsMu.RUnlock()
+		return nil
+	}
+	createdDirsMu.RUnlock()
+	
+	// Not in cache, acquire write lock and create directory
+	createdDirsMu.Lock()
+	defer createdDirsMu.Unlock()
+	
+	// Double-check in case another goroutine created it
+	if createdDirs[dir] {
+		return nil
+	}
+	
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	
+	createdDirs[dir] = true
+	return nil
+}
+
 func processFile(path string) {
+	defer func() {
+		// Update progress counter
+		processed := atomic.AddInt64(&processedFiles, 1)
+		total := atomic.LoadInt64(&totalFiles)
+		if processed%100 == 0 || processed == total {
+			log.Printf("Progress: %d/%d files processed (%.1f%%)", processed, total, float64(processed)/float64(total)*100)
+		}
+	}()
+	
 	ext := strings.ToLower(filepath.Ext(path))
 	filename := filepath.Base(path)
 	var targetFolder string
@@ -185,8 +240,8 @@ func processFile(path string) {
 		return
 	}
 
-	// Create target folder
-	if err := os.MkdirAll(targetFolder, 0755); err != nil {
+	// Create target folder efficiently with caching
+	if err := ensureDir(targetFolder); err != nil {
 		log.Printf("Failed to create directory %s: %v", targetFolder, err)
 		return
 	}
@@ -196,7 +251,7 @@ func processFile(path string) {
 	if err != nil {
 		log.Printf("Could not calculate hash for %s. Moving to errors folder.", filename)
 		targetFolder = errorsDir
-		os.MkdirAll(targetFolder, 0755)
+		ensureDir(targetFolder) // Use optimized directory creation
 		counterMu.Lock()
 		errorCount++
 		counterMu.Unlock()
@@ -204,7 +259,7 @@ func processFile(path string) {
 		// Check for duplicates in the target folder
 		hashMu.Lock()
 		if hashesInDestination[targetFolder] == nil {
-			hashesInDestination[targetFolder] = make(map[string]bool)
+			hashesInDestination[targetFolder] = make(map[string]bool, 100) // Pre-allocate for typical folder size
 		}
 		if hashesInDestination[targetFolder][hash] {
 			hashMu.Unlock()
@@ -256,10 +311,12 @@ func getFileSizeCategory(path string) string {
 	}
 }
 
-// getExifYear tries to extract the year from EXIF metadata
+// getExifYear tries to extract the year from EXIF metadata with optimizations
 func getExifYear(path string) string {
 	ext := strings.ToLower(filepath.Ext(path))
-	if !imageExts[ext] {
+	
+	// Only try EXIF for formats that commonly have it (skip PNG, GIF, BMP for performance)
+	if ext != ".jpg" && ext != ".jpeg" && ext != ".tiff" && ext != ".heic" && ext != ".heif" {
 		return ""
 	}
 
@@ -280,35 +337,49 @@ func getExifYear(path string) string {
 		return ""
 	}
 
-	// Try DateTimeOriginal first (tag 36867)
-	dt, err := x.DateTime()
-	if err == nil {
+	// Try DateTimeOriginal first (most reliable) - this is the most common tag
+	if tag, err := x.Get(exif.DateTimeOriginal); err == nil {
+		if dateStr, err := tag.StringVal(); err == nil && len(dateStr) >= 4 {
+			if year := extractYearFromDateString(dateStr); year != "" {
+				return year
+			}
+		}
+	}
+
+	// Try DateTime() method as fallback
+	if dt, err := x.DateTime(); err == nil {
 		year := dt.Year()
 		if year > 1900 && year <= time.Now().Year()+1 {
 			return strconv.Itoa(year)
 		}
 	}
 
-	// Fallback: try to get any date-related tag
-	tag, err := x.Get(exif.DateTimeOriginal)
-	if err == nil {
-		if dateStr, err := tag.StringVal(); err == nil && len(dateStr) >= 10 {
-			if len(dateStr) >= 4 && dateStr[4] == ':' && len(dateStr) >= 7 && dateStr[7] == ':' {
-				return dateStr[:4]
+	// Try DateTime tag as final fallback
+	if tag, err := x.Get(exif.DateTime); err == nil {
+		if dateStr, err := tag.StringVal(); err == nil && len(dateStr) >= 4 {
+			if year := extractYearFromDateString(dateStr); year != "" {
+				return year
 			}
 		}
 	}
 
-	// Try DateTime tag as fallback
-	tag, err = x.Get(exif.DateTime)
-	if err == nil {
-		if dateStr, err := tag.StringVal(); err == nil && len(dateStr) >= 10 {
-			if len(dateStr) >= 4 && dateStr[4] == ':' && len(dateStr) >= 7 && dateStr[7] == ':' {
-				return dateStr[:4]
+	return ""
+}
+
+// extractYearFromDateString efficiently extracts year from EXIF date string
+func extractYearFromDateString(dateStr string) string {
+	if len(dateStr) >= 4 {
+		// EXIF format is typically "YYYY:MM:DD HH:MM:SS"
+		if len(dateStr) >= 10 && dateStr[4] == ':' && dateStr[7] == ':' {
+			return dateStr[:4]
+		}
+		// Also try just the first 4 characters as year
+		if year := dateStr[:4]; len(year) == 4 {
+			if y, err := strconv.Atoi(year); err == nil && y > 1900 && y <= time.Now().Year()+1 {
+				return year
 			}
 		}
 	}
-
 	return ""
 }
 
@@ -480,7 +551,7 @@ func moveFile(sourcePath, targetFolder, filename, hash, mediaType string) {
 	}
 }
 
-// copyFile copies a file from src to dst
+// copyFile copies a file from src to dst with optimized buffered I/O
 func copyFile(src, dst string) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
@@ -494,7 +565,9 @@ func copyFile(src, dst string) error {
 	}
 	defer dstFile.Close()
 	
-	_, err = io.Copy(dstFile, srcFile)
+	// Use a larger buffer for better performance
+	buf := make([]byte, 64*1024) // 64KB buffer
+	_, err = io.CopyBuffer(dstFile, srcFile, buf)
 	return err
 }
 
@@ -588,16 +661,28 @@ func isDirEmpty(dirPath string) bool {
 	return len(entries) == 0
 }
 
-// fileHash calculates the SHA256 hash of a file
+// fileHash calculates the SHA256 hash of a file with optimized buffered I/O
 func fileHash(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+	
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
+	// Use a larger buffer for better performance on large files
+	buf := make([]byte, 64*1024) // 64KB buffer
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			h.Write(buf[:n])
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
