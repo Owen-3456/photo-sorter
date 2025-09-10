@@ -8,7 +8,7 @@ A Go application to automatically sort photos and videos from an input directory
 
 *   **Concurrent Processing:** Uses multiple goroutines (4 workers) for faster file processing.
 *   **Year-based Sorting:** Sorts images based on EXIF 'Date Taken' metadata (year) into `sorted_photos/YYYY` folders.
-*   **Size-based Categorization:** Places videos and images without valid EXIF date into `no_date` subfolders organized by file size.
+*   **Extension-based Categorization:** Places videos and images without valid EXIF date into `no_date` subfolders organized by file extension.
 *   **Multiple File Types:** Supports common image formats (JPG, JPEG, PNG, GIF, TIFF, BMP, HEIC, HEIF) and video formats (MP4, AVI, MOV, WMV, MKV, FLV, MPEG, MPG, M4V).
 *   **Archive Handling:** Automatically extracts ZIP archives and processes their contents. Other archive formats (RAR, 7Z, TAR, etc.) are moved to a dedicated `archives` folder.
 *   **HEIC/HEIF Support:** Converts `.heic` and `.heif` files to JPEG format (currently placeholder - requires external tool like ImageMagick).
@@ -34,13 +34,13 @@ unsorted_photos/    # Input directory (user-provided)
 sorted_photos/
 ├── 2023/           # Images with EXIF year 2023
 ├── 2024/           # Images with EXIF year 2024
-├── no_date/        # Files without EXIF date, organized by size:
-│   ├── tiny_under_0.5MB/
-│   ├── small_0.5-1MB/
-│   ├── medium_1-2MB/
-│   ├── large_2-5MB/
-│   ├── xlarge_5-10MB/
-│   └── huge_over_10MB/
+├── no_date/        # Files without EXIF date, organized by extension:
+│   ├── jpg/
+│   ├── png/
+│   ├── mov/
+│   ├── mp4/
+│   ├── gif/
+│   └── pdf/
 ├── archives/       # RAR, 7Z, TAR and other non-ZIP archive files
 └── errors/         # Files that caused processing errors
 ```

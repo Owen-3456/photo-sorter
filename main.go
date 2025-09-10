@@ -68,7 +68,7 @@ func main() {
 	log.Printf("Starting media sort from '%s' to '%s'...", sourceDir, destDir)
 	log.Println("HEIC/HEIF files will be converted to JPEG.")
 	log.Println("IMPORTANT: Sorting by 'Date Taken' metadata ONLY - ignoring file system dates (modified/created)")
-	log.Println("Files without 'Date Taken' metadata will be sorted by size in 'no_date' folder")
+	log.Println("Files without 'Date Taken' metadata will be sorted by extension in 'no_date' folder")
 	log.Println("ZIP archives will be extracted and contents processed automatically")
 
 	// Check if source directory exists
@@ -247,10 +247,10 @@ func processFile(path string) {
 			targetFolder = filepath.Join(destDir, yearOrStatus)
 			log.Printf("Processing '%s' (%s) for year '%s' (from Date Taken metadata)", filename, mediaType, yearOrStatus)
 		} else {
-			// No "Date Taken" metadata found - sort by file size (ignoring file system dates)
-			sizeCat := getFileSizeCategory(path)
-			targetFolder = filepath.Join(noDateDir, sizeCat)
-			log.Printf("Processing '%s' (%s) for '%s' (no Date Taken metadata found, ignoring file dates, sorting by size: %s)", filename, mediaType, filepath.Join("no_date", sizeCat), sizeCat)
+			// No "Date Taken" metadata found - sort by file extension (ignoring file system dates)
+			extCat := getFileExtensionCategory(path)
+			targetFolder = filepath.Join(noDateDir, extCat)
+			log.Printf("Processing '%s' (%s) for '%s' (no Date Taken metadata found, ignoring file dates, sorting by extension: %s)", filename, mediaType, filepath.Join("no_date", extCat), extCat)
 			counterMu.Lock()
 			noDateCount++
 			counterMu.Unlock()
@@ -308,28 +308,14 @@ func processFile(path string) {
 		moveFile(path, targetFolder, filename, hash, mediaType)
 	}
 }
-// getFileSizeCategory categorizes files by size for no_date sorting
-func getFileSizeCategory(path string) string {
-	fi, err := os.Stat(path)
-	if err != nil {
-		log.Printf("Could not get file size for %s: %v", path, err)
-		return "unknown_size"
+// getFileExtensionCategory categorizes files by extension for no_date sorting
+func getFileExtensionCategory(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == "" {
+		return "no_extension"
 	}
-	sizeMB := float64(fi.Size()) / (1024 * 1024)
-	switch {
-	case sizeMB < 0.5:
-		return "tiny_under_0.5MB"
-	case sizeMB < 1:
-		return "small_0.5-1MB"
-	case sizeMB < 2:
-		return "medium_1-2MB"
-	case sizeMB < 5:
-		return "large_2-5MB"
-	case sizeMB < 10:
-		return "xlarge_5-10MB"
-	default:
-		return "huge_over_10MB"
-	}
+	// Remove the dot from extension for folder name
+	return ext[1:]
 }
 
 // getExifYear tries to extract the year from EXIF "Date Taken" metadata ONLY
@@ -740,23 +726,84 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-// printSummary prints the final summary with emphasis on date handling approach
+// printSummary prints a comprehensive final summary with statistics and performance metrics
 func printSummary() {
-	log.Println("--- Sorting Summary ---")
-	log.Println("NOTE: All sorting was based on 'Date Taken' metadata only (file system dates ignored)")
-	log.Printf("Photos moved/converted to year folders (by Date Taken): %d", movedCount)
-	log.Printf("Videos moved to year folders (by metadata): %d", videoMovedCount)
-	log.Printf("HEIC files converted to JPEG: %d", heicConvertedCount)
-	log.Printf("Media files moved to 'no_date' subfolders (no Date Taken metadata, sorted by size): %d", noDateCount)
-	log.Printf("Archive files extracted and contents processed: %d", archiveExtractedCount)
-	log.Printf("Archive files moved to 'archives' (could not extract): %d", archiveMovedCount)
-	log.Printf("Non-media files deleted: %d", deletedNonMediaCount)
-	log.Printf("Files moved to 'errors' due to errors: %d", errorCount)
-	log.Printf("Files skipped (e.g., already in destination, not found): %d", skippedCount)
-	log.Printf("Duplicate files deleted from source: %d", duplicateDeletedCount)
-	log.Println("------------------------")
-	log.Println("Media sorting process finished.")
-	log.Println("All files were sorted by 'Date Taken' metadata - file system dates were ignored.")
+	totalProcessed := atomic.LoadInt64(&processedFiles)
+	totalFound := atomic.LoadInt64(&totalFiles)
+	
+	log.Println("")
+	log.Println("═══════════════════════════════════════════════════════════════")
+	log.Println("                    📊 PHOTO SORTING COMPLETE 📊")
+	log.Println("═══════════════════════════════════════════════════════════════")
+	log.Println("")
+	
+	// File Processing Summary
+	log.Println("📁 FILE PROCESSING SUMMARY:")
+	log.Printf("   • Total files found: %d", totalFound)
+	log.Printf("   • Total files processed: %d", totalProcessed)
+	log.Printf("   • Processing completion: %.1f%%", float64(totalProcessed)/float64(totalFound)*100)
+	log.Println("")
+	
+	// Successful Operations
+	log.Println("✅ SUCCESSFUL OPERATIONS:")
+	successfulOps := movedCount + videoMovedCount + heicConvertedCount + noDateCount + archiveExtractedCount + archiveMovedCount
+	log.Printf("   📷 Photos sorted by Date Taken: %d", movedCount)
+	log.Printf("   🎬 Videos sorted by metadata: %d", videoMovedCount)
+	log.Printf("   🔄 HEIC/HEIF files converted to JPEG: %d", heicConvertedCount)
+	log.Printf("   📂 Files sorted by extension (no date): %d", noDateCount)
+	log.Printf("   📦 ZIP archives extracted & processed: %d", archiveExtractedCount)
+	log.Printf("   📥 Archives moved (non-ZIP): %d", archiveMovedCount)
+	log.Printf("   🗑️  Non-media files deleted: %d", deletedNonMediaCount)
+	log.Printf("   ➡️  Total successful operations: %d", successfulOps)
+	log.Println("")
+	
+	// Issues and Cleanup
+	issueCount := errorCount + duplicateDeletedCount + skippedCount
+	if issueCount > 0 {
+		log.Println("⚠️  ISSUES HANDLED:")
+		if errorCount > 0 {
+			log.Printf("   ❌ Files moved to 'errors' folder: %d", errorCount)
+		}
+		if duplicateDeletedCount > 0 {
+			log.Printf("   🔄 Duplicate files deleted: %d", duplicateDeletedCount)
+		}
+		if skippedCount > 0 {
+			log.Printf("   ⏭️  Files skipped (already processed): %d", skippedCount)
+		}
+		log.Printf("   📊 Total issues handled: %d", issueCount)
+		log.Println("")
+	}
+	
+	// Performance Stats
+	log.Println("⚡ PERFORMANCE & SETTINGS:")
+	log.Printf("   🔧 Worker goroutines used: %d", runtime.NumCPU()*2)
+	log.Printf("   📋 Sorting method: Date Taken metadata only")
+	log.Printf("   🚫 File system dates: Ignored")
+	log.Printf("   📁 Extension-based sorting: Enabled for no-date files")
+	log.Printf("   📦 ZIP auto-extraction: Enabled")
+	log.Println("")
+	
+	// Directory Locations
+	log.Println("📍 OUTPUT LOCATIONS:")
+	log.Printf("   📂 Sorted photos: %s", destDir)
+	log.Printf("   📅 No-date files: %s", noDateDir)
+	log.Printf("   📦 Archives: %s", archivesDir)
+	if errorCount > 0 {
+		log.Printf("   ❌ Error files: %s", errorsDir)
+	}
+	log.Println("")
+	
+	// Final Status
+	if errorCount > 0 {
+		log.Println("⚠️  COMPLETED WITH ISSUES - Check the 'errors' folder for problematic files")
+	} else {
+		log.Println("🎉 COMPLETED SUCCESSFULLY - All files processed without errors!")
+	}
+	
+	log.Println("═══════════════════════════════════════════════════════════════")
+	log.Printf("📋 IMPORTANT: All sorting based on 'Date Taken' metadata only")
+	log.Printf("🔍 Review your sorted files in: %s", destDir)
+	log.Println("═══════════════════════════════════════════════════════════════")
 }
 
 // cleanupEmptyDirectories recursively removes empty directories in the source path
