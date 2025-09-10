@@ -10,7 +10,7 @@ A Go application to automatically sort photos and videos from an input directory
 *   **Year-based Sorting:** Sorts images based on EXIF 'Date Taken' metadata (year) into `sorted_photos/YYYY` folders.
 *   **Size-based Categorization:** Places videos and images without valid EXIF date into `no_date` subfolders organized by file size.
 *   **Multiple File Types:** Supports common image formats (JPG, JPEG, PNG, GIF, TIFF, BMP, HEIC, HEIF) and video formats (MP4, AVI, MOV, WMV, MKV, FLV, MPEG, MPG, M4V).
-*   **Archive Handling:** Moves archive files (ZIP, RAR, 7Z, TAR, etc.) to a dedicated `archives` folder.
+*   **Archive Handling:** Automatically extracts ZIP archives and processes their contents. Other archive formats (RAR, 7Z, TAR, etc.) are moved to a dedicated `archives` folder.
 *   **HEIC/HEIF Support:** Converts `.heic` and `.heif` files to JPEG format (currently placeholder - requires external tool like ImageMagick).
 *   **Duplicate Detection:** Calculates SHA256 hashes to identify and handle duplicate files. Duplicates are deleted from source.
 *   **Error Handling:** Moves files that cause processing errors to an `errors` folder.
@@ -23,7 +23,7 @@ A Go application to automatically sort photos and videos from an input directory
 1.  **Place Files:** Put all the photos and videos you want to sort into the `unsorted_photos` directory (create this folder in the same location as the executable). You can have subdirectories within `unsorted_photos`; the application will scan recursively.
 2.  **Run the program** Download the latest release from the [Releases](github.com/Owen-3456/photo-sorter/releases) page.
 3.  **Check Errors:** Check the console output and the `errors` folder for any issues.
-4. **Check Archives:** If you want to sort files from archives, extract them manually into the `unsorted_photos` folder and rerun the program.
+4. **Archive Processing:** ZIP files will be automatically extracted and their contents processed. Other archive types will be moved to the `archives` folder.
 
 ## Directory Structure
 
@@ -41,6 +41,6 @@ sorted_photos/
 │   ├── large_2-5MB/
 │   ├── xlarge_5-10MB/
 │   └── huge_over_10MB/
-├── archives/       # ZIP, RAR, 7Z and other archive files
+├── archives/       # RAR, 7Z, TAR and other non-ZIP archive files
 └── errors/         # Files that caused processing errors
 ```

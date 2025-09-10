@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -53,6 +54,7 @@ var (
 	heicConvertedCount      int
 	noDateCount             int
 	archiveMovedCount       int
+	archiveExtractedCount   int // New counter for extracted archives
 	deletedNonMediaCount    int
 	errorCount              int
 	skippedCount            int
@@ -67,6 +69,7 @@ func main() {
 	log.Println("HEIC/HEIF files will be converted to JPEG.")
 	log.Println("IMPORTANT: Sorting by 'Date Taken' metadata ONLY - ignoring file system dates (modified/created)")
 	log.Println("Files without 'Date Taken' metadata will be sorted by size in 'no_date' folder")
+	log.Println("ZIP archives will be extracted and contents processed automatically")
 
 	// Check if source directory exists
 	if _, err := os.Stat(sourceDir); os.IsNotExist(err) {
@@ -195,11 +198,25 @@ func processFile(path string) {
 		yearOrStatus = getVideoDateYear(path)
 	} else if archiveExts[ext] {
 		mediaType = "archive"
-		targetFolder = archivesDir
-		log.Printf("Moving '%s' to '%s' (archive file)", filename, "archives")
-		counterMu.Lock()
-		archiveMovedCount++
-		counterMu.Unlock()
+		// Try to extract archive contents and process them
+		if extractArchive(path) {
+			log.Printf("Successfully extracted and processed contents of '%s'", filename)
+			counterMu.Lock()
+			archiveExtractedCount++
+			counterMu.Unlock()
+			// Delete the original archive after successful extraction
+			if err := os.Remove(path); err != nil {
+				log.Printf("Warning: Could not delete original archive '%s' after extraction: %v", path, err)
+			}
+			return
+		} else {
+			// Extraction failed, move to archives folder as before
+			targetFolder = archivesDir
+			log.Printf("Could not extract '%s', moving to '%s' (archive file)", filename, "archives")
+			counterMu.Lock()
+			archiveMovedCount++
+			counterMu.Unlock()
+		}
 	} else {
 		mediaType = "other"
 		// Delete non-media files
@@ -417,6 +434,124 @@ func getVideoDateYear(path string) string {
 	return ""
 }
 
+// extractArchive attempts to extract an archive and process its contents
+// Returns true if extraction was successful, false otherwise
+func extractArchive(archivePath string) bool {
+	ext := strings.ToLower(filepath.Ext(archivePath))
+	filename := filepath.Base(archivePath)
+	
+	// Create temporary extraction directory
+	tempDir := filepath.Join(filepath.Dir(archivePath), "temp_extract_"+strings.TrimSuffix(filename, ext))
+	
+	var extractSuccess bool
+	
+	switch ext {
+	case ".zip":
+		extractSuccess = extractZip(archivePath, tempDir)
+	default:
+		// For other archive types (.rar, .7z, .tar, etc.), we currently can't extract
+		log.Printf("Archive type '%s' not supported for extraction: %s", ext, filename)
+		return false
+	}
+	
+	if !extractSuccess {
+		// Clean up temp directory if extraction failed
+		os.RemoveAll(tempDir)
+		return false
+	}
+	
+	// Process extracted files
+	log.Printf("Processing extracted files from '%s'...", filename)
+	err := filepath.Walk(tempDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			log.Printf("Error walking extracted files: %v", err)
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		
+		// Process each extracted file as if it was in the original source
+		processFile(path)
+		return nil
+	})
+	
+	// Clean up temporary extraction directory
+	if err := os.RemoveAll(tempDir); err != nil {
+		log.Printf("Warning: Could not clean up temporary extraction directory '%s': %v", tempDir, err)
+	}
+	
+	if err != nil {
+		log.Printf("Error processing extracted files from '%s': %v", filename, err)
+		return false
+	}
+	
+	return true
+}
+
+// extractZip extracts a ZIP file to the specified directory
+func extractZip(zipPath, destDir string) bool {
+	reader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		log.Printf("Error opening ZIP file '%s': %v", filepath.Base(zipPath), err)
+		return false
+	}
+	defer reader.Close()
+	
+	// Create destination directory
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		log.Printf("Error creating extraction directory '%s': %v", destDir, err)
+		return false
+	}
+	
+	// Extract each file
+	for _, file := range reader.File {
+		// Skip directories
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		
+		// Create the file path
+		filePath := filepath.Join(destDir, file.Name)
+		
+		// Create directory structure if needed
+		if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+			log.Printf("Error creating directory structure for '%s': %v", file.Name, err)
+			continue
+		}
+		
+		// Open the file in the ZIP
+		rc, err := file.Open()
+		if err != nil {
+			log.Printf("Error opening file '%s' in ZIP: %v", file.Name, err)
+			continue
+		}
+		
+		// Create the destination file
+		outFile, err := os.Create(filePath)
+		if err != nil {
+			log.Printf("Error creating extracted file '%s': %v", filePath, err)
+			rc.Close()
+			continue
+		}
+		
+		// Copy the file contents
+		_, err = io.Copy(outFile, rc)
+		outFile.Close()
+		rc.Close()
+		
+		if err != nil {
+			log.Printf("Error extracting file '%s': %v", file.Name, err)
+			os.Remove(filePath) // Clean up partially extracted file
+			continue
+		}
+		
+		log.Printf("Extracted: %s", file.Name)
+	}
+	
+	return true
+}
+
 // convertHEIC handles HEIC to JPEG conversion (stub - requires external tool)
 func convertHEIC(sourcePath, targetFolder, hash string) {
 	// For now, just log that HEIC conversion would happen
@@ -613,7 +748,8 @@ func printSummary() {
 	log.Printf("Videos moved to year folders (by metadata): %d", videoMovedCount)
 	log.Printf("HEIC files converted to JPEG: %d", heicConvertedCount)
 	log.Printf("Media files moved to 'no_date' subfolders (no Date Taken metadata, sorted by size): %d", noDateCount)
-	log.Printf("Archive files moved to 'archives': %d", archiveMovedCount)
+	log.Printf("Archive files extracted and contents processed: %d", archiveExtractedCount)
+	log.Printf("Archive files moved to 'archives' (could not extract): %d", archiveMovedCount)
 	log.Printf("Non-media files deleted: %d", deletedNonMediaCount)
 	log.Printf("Files moved to 'errors' due to errors: %d", errorCount)
 	log.Printf("Files skipped (e.g., already in destination, not found): %d", skippedCount)
